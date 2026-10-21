@@ -194,7 +194,7 @@ Backend fields:
 
 | Field | Description |
 |-------|-------------|
-| `socket` | Unix socket path to the backend |
+| `socket` | Unix socket path, or `host:port` for TCP (e.g. `127.0.0.1:9000`, `[::1]:9000`) |
 | `protocol` | `fastcgi` (default) or `http` |
 | `document_root` | Passed as `DOCUMENT_ROOT` to FastCGI |
 | `routes` | URL prefixes this backend handles |

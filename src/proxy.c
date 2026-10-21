@@ -13,6 +13,7 @@
 #include "userver.h"
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netdb.h>
 #include <errno.h>
 #include <ctype.h>
 
@@ -35,7 +36,30 @@ UBackend* proxy_match(const UReq* req) {
 
 /* ── Unix socket connection ──────────────────────────────────────── */
 
+/* "host:port" or "[v6]:port" → TCP; anything else is a Unix socket path */
+static int connect_tcp(const char* spec) {
+    char host[256];
+    const char* colon = strrchr(spec, ':');
+    if (!colon || (size_t)(colon - spec) >= sizeof host) return -1;
+    snprintf(host, sizeof host, "%.*s", (int)(colon - spec), spec);
+    char* h = host;
+    if (*h == '[') { h++; char* e = strchr(h, ']'); if (e) *e = 0; }
+
+    struct addrinfo hints = { .ai_socktype = SOCK_STREAM }, *res, *ai;
+    if (getaddrinfo(h, colon + 1, &hints, &res)) return -1;
+    int fd = -1;
+    for (ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
 static int connect_unix(const char* path) {
+    if (path[0] != '/') return connect_tcp(path);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 

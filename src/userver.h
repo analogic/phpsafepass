@@ -184,7 +184,7 @@ typedef struct {
 
 typedef struct {
     char*               name;                       /* "php", "node", ... */
-    char*               socket_path;                /* Unix socket */
+    char*               socket_path;                /* Unix socket, or host:port */
     UProxyProto         protocol;                   /* fastcgi or http */
     char*               routes[PROXY_MAX_ROUTES];   /* prefix matches */
     int                 n_routes;

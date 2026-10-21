@@ -247,6 +247,11 @@ int sanitize_multipart(UReq* req, UResp* resp, const UBackendConstraints* bc) {
         if (!mp->disposition) { reject(resp, 400, "Multipart part missing Content-Disposition"); goto mp_fail; }
         mp->name = mp_param(mp->disposition, "name");
         if (!mp->name) { reject(resp, 400, "Multipart part missing name"); goto mp_fail; }
+        /* the field that wakes session.upload_progress (CVE-2026-109618);
+           php.ini's default name, change both together */
+        if (!strcmp(mp->name, "PHP_SESSION_UPLOAD_PROGRESS")) {
+            reject(resp, 400, "Upload progress field not allowed"); goto mp_fail;
+        }
         /* Reject quotes in name/filename to prevent Content-Disposition
            injection during re-serialization (the values are embedded in
            double-quoted fields). */
@@ -476,35 +481,45 @@ void sanitize_headers(UReq* req, const char* remote_ip, int tls) {
     req->nh = w;
 
     /* Add forwarding headers.  We allocate these strings and track
-       them in req->allocs so they get freed with the request. */
-    if (req->nh + 3 <= UREQ_MAX_HEADERS) {
-        /* X-Forwarded-For */
-        char* xff = strdup(remote_ip);
+       them in req->allocs so they get freed with the request.  Not for a
+       FastCGI client: its HTTPS and REMOTE_ADDR params say it already. */
+    if (req->nh + 3 <= UREQ_MAX_HEADERS && !req->fcgi_params) {
+        /* only when the front server did not set them already: behind
+           Apache/nginx these carry the real client IP and scheme */
         req->allocs = realloc(req->allocs, sizeof(char*) * (size_t)(req->nallocs + 3));
-        req->allocs[req->nallocs++] = xff;
-        req->h[req->nh].name = "x-forwarded-for";
-        req->h[req->nh].value = xff;
-        req->nh++;
+
+        /* X-Forwarded-For */
+        if (!ureq_header(req, "x-forwarded-for")) {
+            char* xff = strdup(remote_ip);
+            req->allocs[req->nallocs++] = xff;
+            req->h[req->nh].name = "x-forwarded-for";
+            req->h[req->nh].value = xff;
+            req->nh++;
+        }
 
         /* X-Forwarded-Proto */
-        req->h[req->nh].name = "x-forwarded-proto";
-        req->h[req->nh].value = tls ? "https" : "http";
-        req->nh++;
+        if (!ureq_header(req, "x-forwarded-proto")) {
+            req->h[req->nh].name = "x-forwarded-proto";
+            req->h[req->nh].value = tls ? "https" : "http";
+            req->nh++;
+        }
 
         /* X-Request-Id */
-        char* rid = malloc(37);
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        snprintf(rid, 37, "%08lx-%04x-%04x-%04x-%012lx",
-                 (unsigned long)(ts.tv_sec & 0xFFFFFFFF),
-                 (unsigned)((ts.tv_nsec >> 16) & 0xFFFF),
-                 (unsigned)(ts.tv_nsec & 0xFFFF),
-                 (unsigned)((uintptr_t)req & 0xFFFF),
-                 (unsigned long)(ts.tv_nsec * 1000 + ts.tv_sec));
-        req->allocs[req->nallocs++] = rid;
-        req->h[req->nh].name = "x-request-id";
-        req->h[req->nh].value = rid;
-        req->nh++;
+        if (!ureq_header(req, "x-request-id")) {
+            char* rid = malloc(37);
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            snprintf(rid, 37, "%08lx-%04x-%04x-%04x-%012lx",
+                     (unsigned long)(ts.tv_sec & 0xFFFFFFFF),
+                     (unsigned)((ts.tv_nsec >> 16) & 0xFFFF),
+                     (unsigned)(ts.tv_nsec & 0xFFFF),
+                     (unsigned)((uintptr_t)req & 0xFFFF),
+                     (unsigned long)(ts.tv_nsec * 1000 + ts.tv_sec));
+            req->allocs[req->nallocs++] = rid;
+            req->h[req->nh].name = "x-request-id";
+            req->h[req->nh].value = rid;
+            req->nh++;
+        }
     }
 }
 

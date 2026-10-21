@@ -276,6 +276,145 @@ static int parse_cgi_response(UBuf* raw, UResp* resp) {
     return 0;
 }
 
+/* one FastCGI name/value length (1 or 4 bytes); -1 when truncated */
+static int param_len(const uint8_t* p, size_t n, size_t* i, size_t* out) {
+    if (*i >= n) return -1;
+    if (p[*i] < 128) { *out = p[(*i)++]; return 0; }
+    if (*i + 4 > n) return -1;
+    *out = ((size_t)(p[*i] & 0x7f) << 24) | ((size_t)p[*i + 1] << 16) | ((size_t)p[*i + 2] << 8) | p[*i + 3];
+    *i += 4;
+    return 0;
+}
+
+/* walk name/value pairs; f returns nonzero to stop.  -1 on malformed */
+int fcgi_each_param(const char* raw, size_t n,
+                      int (*f)(void* ctx, const char* k, size_t kl, const char* v, size_t vl), void* ctx) {
+    const uint8_t* p = (const uint8_t*)raw;
+    size_t i = 0, kl, vl;
+    while (i < n) {
+        if (param_len(p, n, &i, &kl) || param_len(p, n, &i, &vl) || kl > n - i || vl > n - i - kl) return -1;
+        if (f(ctx, raw + i, kl, raw + i + kl, vl)) return 0;
+        i += kl + vl;
+    }
+    return 0;
+}
+
+static int is_param(const char* k, size_t kl, const char* name) { return kl == strlen(name) && !memcmp(k, name, kl); }
+
+static int copy_one(void* ctx, const char* k, size_t kl, const char* v, size_t vl) {
+    if ((kl >= 5 && !memcmp(k, "HTTP_", 5)) || is_param(k, kl, "CONTENT_TYPE") || is_param(k, kl, "CONTENT_LENGTH")) return 0;
+    encode_param((UBuf*)ctx, k, kl, v, vl);
+    return 0;
+}
+static void copy_params(UBuf* out, const char* raw, size_t n) { fcgi_each_param(raw, n, copy_one, out); }
+
+/* ── FastCGI client side (Apache proxy:fcgi → us) ────────────────── */
+
+typedef struct { UBuf* http; const char* method; size_t ml; const char* uri; size_t ul; int bad; } Xlate;
+
+static int xlate_one(void* ctx, const char* k, size_t kl, const char* v, size_t vl) {
+    Xlate* x = ctx;
+    /* these bytes become an HTTP header block: no CR, LF or NUL anywhere */
+    if (memchr(v, '\r', vl) || memchr(v, '\n', vl) || memchr(v, 0, vl) ||
+        memchr(k, '\r', kl) || memchr(k, '\n', kl) || memchr(k, 0, kl) || memchr(k, ':', kl)) { x->bad = 1; return 1; }
+    if (is_param(k, kl, "REQUEST_METHOD")) { x->method = v; x->ml = vl; }
+    else if (is_param(k, kl, "REQUEST_URI")) { x->uri = v; x->ul = vl; }
+    else if (is_param(k, kl, "CONTENT_TYPE")) ubuf_printf(x->http, "Content-Type: %.*s\r\n", (int)vl, v);
+    else if (kl > 5 && !memcmp(k, "HTTP_", 5)) {
+        /* framing is ours (Content-Length below); HTTP_PROXY is httpoxy */
+        if (is_param(k, kl, "HTTP_CONTENT_LENGTH") || is_param(k, kl, "HTTP_TRANSFER_ENCODING") ||
+            is_param(k, kl, "HTTP_PROXY")) return 0;
+        for (size_t j = 5; j < kl; j++) { char ch = k[j] == '_' ? '-' : k[j]; ubuf_add(x->http, &ch, 1); }
+        ubuf_printf(x->http, ": %.*s\r\n", (int)vl, v);
+    }
+    return 0;
+}
+
+int fcgi_in_translate(UConn* c, UResp* err) {
+    const uint8_t* p = (const uint8_t*)c->in.data;
+    size_t n = c->in.len, i = 0;
+    UBuf params = {0}, body = {0};
+    int got_begin = 0, done = 0;
+    while (!done) {
+        if (n - i < 8) goto incomplete;
+        uint8_t type = p[i + 1];
+        size_t cl = get_u16be(p + i + 4), pl = p[i + 6];
+        if (p[i] != 1) goto bad;
+        if (n - i < 8 + cl + pl) goto incomplete;
+        const uint8_t* d = p + i + 8;
+        if (type == FCGI_BEGIN_REQUEST && cl >= 8) {
+            got_begin = 1;
+            c->fcgi_id = get_u16be(p + i + 2);
+            c->fcgi_keep = d[2] & 1;
+            if (get_u16be(d) != FCGI_RESPONDER) goto bad;
+        } else if (type == FCGI_PARAMS) {
+            ubuf_add(&params, d, cl);
+        } else if (type == FCGI_STDIN) {
+            if (cl == 0) done = 1;
+            else if (body.len + cl > g_cfg.max_post) { ubuf_free(&params); ubuf_free(&body); err->status = 413;
+                uresp_header(err, "Content-Type", "text/plain; charset=utf-8"); ubuf_adds(&err->body, "Payload Too Large"); return -1; }
+            else ubuf_add(&body, d, cl);
+        }   /* ABORT_REQUEST, GET_VALUES: nothing to do for a single request */
+        i += 8 + cl + pl;
+    }
+    if (!got_begin) goto bad;
+
+    UBuf http = {0}, hdrs = {0};
+    Xlate x = { &hdrs, "GET", 3, NULL, 0, 0 };
+    if (fcgi_each_param(params.data, params.len, xlate_one, &x) || x.bad || !x.uri || !x.ul) { ubuf_free(&hdrs); goto bad; }
+    ubuf_printf(&http, "%.*s %.*s HTTP/1.1\r\n", (int)x.ml, x.method, (int)x.ul, x.uri);
+    if (hdrs.len) ubuf_add(&http, hdrs.data, hdrs.len);
+    ubuf_free(&hdrs);
+    if (body.len) ubuf_printf(&http, "Content-Length: %zu\r\n", body.len);
+    ubuf_adds(&http, "\r\n");
+    if (body.len) ubuf_add(&http, body.data, body.len);
+    ubuf_free(&body);
+
+    /* swap the FastCGI request for its HTTP form, keep anything after it */
+    if (n > i) ubuf_add(&http, c->in.data + i, n - i);
+    ubuf_free(&c->in);
+    c->in = http;
+    free(c->fcgi_params);
+    c->fcgi_params = params.data ? params.data : calloc(1, 1);
+    c->fcgi_params_len = params.len;
+    return 1;
+
+incomplete:
+    ubuf_free(&params); ubuf_free(&body);
+    if (n > g_cfg.max_post + g_cfg.max_header + 65536) { err->status = 413;
+        uresp_header(err, "Content-Type", "text/plain; charset=utf-8"); ubuf_adds(&err->body, "Payload Too Large"); return -1; }
+    return 0;
+bad:
+    ubuf_free(&params); ubuf_free(&body);
+    err->status = 400;
+    uresp_header(err, "Content-Type", "text/plain; charset=utf-8");
+    ubuf_adds(&err->body, "Bad Request: malformed FastCGI request");
+    return -1;
+}
+
+/* the response as CGI (Status: + headers + body) in STDOUT records */
+void fcgi_in_response(uint16_t id, const UResp* resp, int send_body, UBuf* out) {
+    UBuf cgi = {0};
+    ubuf_printf(&cgi, "Status: %d %s\r\n", resp->status, http_reason(resp->status));
+    if (resp->head.len) ubuf_add(&cgi, resp->head.data, resp->head.len);
+    if (!resp->has_ctype) ubuf_adds(&cgi, "Content-Type: text/plain; charset=utf-8\r\n");
+    ubuf_adds(&cgi, "\r\n");
+    if (send_body && resp->body.len) ubuf_add(&cgi, resp->body.data, resp->body.len);
+
+    uint8_t h[8];
+    for (size_t off = 0; off < cgi.len; ) {
+        size_t chunk = cgi.len - off > FCGI_MAX_CONTENT ? FCGI_MAX_CONTENT : cgi.len - off;
+        fcgi_header(h, FCGI_STDOUT, (uint16_t)chunk); put_u16be(h + 2, id);
+        ubuf_add(out, h, 8); ubuf_add(out, cgi.data + off, chunk);
+        off += chunk;
+    }
+    ubuf_free(&cgi);
+    fcgi_header(h, FCGI_STDOUT, 0); put_u16be(h + 2, id); ubuf_add(out, h, 8);
+    static const uint8_t end[8] = { 0, 0, 0, 0, 0 /* FCGI_REQUEST_COMPLETE */, 0, 0, 0 };
+    fcgi_header(h, FCGI_END_REQUEST, 8); put_u16be(h + 2, id);
+    ubuf_add(out, h, 8); ubuf_add(out, end, 8);
+}
+
 /* ── public API ──────────────────────────────────────────────────── */
 
 int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
@@ -285,6 +424,13 @@ int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
 
     /* Build PARAMS */
     UBuf params = {0};
+    if (req->fcgi_params) {
+        /* Apache already resolved the script, PATH_INFO, HTTPS, REMOTE_ADDR:
+           keep its params, but body framing and headers come from the
+           sanitized request below */
+        copy_params(&params, req->fcgi_params, req->fcgi_params_len);
+        goto headers;
+    }
     add_param(&params, "REQUEST_METHOD", req->method);
     add_param(&params, "REQUEST_URI", req->uri);
     add_param(&params, "QUERY_STRING", req->query);
@@ -294,8 +440,10 @@ int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
     char sf[4096];
     snprintf(sf, sizeof sf, "%s", script_filename);
     char* pi = strstr(sf, ".php/");
-    char path_info[4096] = "";
-    if (pi) { snprintf(path_info, sizeof path_info, "%s", pi + 4); pi[4] = 0; }
+    if (pi) pi[4] = 0;
+    /* from the URL, not script_filename: proxy.c appends index.php to a trailing / */
+    const char* upi = strstr(req->path, ".php/");
+    const char* path_info = upi ? upi + 4 : "";
     add_param(&params, "SCRIPT_FILENAME", sf);
     char script_name[4096];
     const char* rel = sf + strlen(document_root);
@@ -307,8 +455,21 @@ int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
     add_param(&params, "PHP_SELF", self);
     add_param(&params, "SERVER_PROTOCOL", "HTTP/1.1");
     add_param(&params, "SERVER_NAME", ureq_header(req, "host"));
-    add_param(&params, "REMOTE_ADDR", req->remote_ip);
-    add_param(&params, "HTTPS", req->tls ? "on" : "");
+    /* behind a local front server the client is the last X-Forwarded-For
+       entry (the one it appended); earlier entries are client-supplied */
+    char raddr[64];
+    snprintf(raddr, sizeof raddr, "%s", req->remote_ip);
+    const char* xff = ureq_header(req, "x-forwarded-for");
+    if (xff && (!strcmp(req->remote_ip, "127.0.0.1") || !strcmp(req->remote_ip, "::1"))) {
+        const char* last = strrchr(xff, ',');
+        last = last ? last + 1 : xff;
+        while (*last == ' ') last++;
+        snprintf(raddr, sizeof raddr, "%.*s", (int)strcspn(last, " "), last);
+    }
+    add_param(&params, "REMOTE_ADDR", raddr);
+    /* TLS ends at the front server, which says so in X-Forwarded-Proto */
+    const char* xfp = ureq_header(req, "x-forwarded-proto");
+    add_param(&params, "HTTPS", req->tls || (xfp && !strcasecmp(xfp, "https")) ? "on" : "");
 
     char portbuf[8];
     snprintf(portbuf, sizeof portbuf, "%d", req->local_port);
@@ -318,6 +479,7 @@ int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
     snprintf(rportbuf, sizeof rportbuf, "%d", req->remote_port);
     add_param(&params, "REMOTE_PORT", rportbuf);
 
+headers:
     /* Content-Type and Content-Length */
     const char* ct = ureq_header(req, "content-type");
     if (ct) add_param(&params, "CONTENT_TYPE", ct);
@@ -335,7 +497,7 @@ int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
 
         /* Build HTTP_NAME (uppercase, hyphens to underscores) */
         char envname[256];
-        snprintf(envname, 5, "HTTP_");
+        memcpy(envname, "HTTP_", 5);
         size_t j = 5;
         for (const char* c = name; *c && j < sizeof(envname) - 1; c++) {
             envname[j++] = (*c == '-') ? '_' : (char)toupper((unsigned char)*c);

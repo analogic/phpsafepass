@@ -51,7 +51,7 @@ static char* keep(UReq* r, char* p) {
 
 void ureq_free(UReq* r) {
     for (int i = 0; i < r->nallocs; i++) free(r->allocs[i]);
-    free(r->allocs); free(r->mem); free(r->bodymem); free(r->path);
+    free(r->allocs); free(r->mem); free(r->bodymem); free(r->path); free(r->fcgi_params);
     memset(r, 0, sizeof *r);
 }
 

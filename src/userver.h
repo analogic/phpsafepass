@@ -82,6 +82,8 @@ typedef struct {
     char*    bodymem;
     char**   allocs;      /* combined header values, raw names */
     int      nallocs;
+    char*    fcgi_params;  /* raw PARAMS when the client spoke FastCGI (Apache proxy:fcgi) */
+    size_t   fcgi_params_len;
 } UReq;
 
 const char* ureq_header(const UReq* r, const char* lname);
@@ -142,6 +144,11 @@ typedef struct UConn {
     int           stream_status;
     struct UConn* next_live;    /* per-loop list, for idle sweeps */
     struct UConn* prev_live;
+    int           fcgi;         /* the client speaks FastCGI, not HTTP */
+    uint16_t      fcgi_id;      /* its request id */
+    int           fcgi_keep;    /* FCGI_KEEP_CONN */
+    char*         fcgi_params;  /* PARAMS of the request being translated */
+    size_t        fcgi_params_len;
 } UConn;
 
 typedef struct UJson UJson;
@@ -402,6 +409,13 @@ void sanitize_headers(UReq* req, const char* remote_ip, int tls);               
 /* FastCGI (fastcgi.c) */
 int  fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
                      const char* document_root, const char* script_filename);   /* 1=done */
+/* FastCGI on the listening side: a request becomes HTTP bytes in c->in for
+   http_parse, the response goes back as FastCGI records */
+int  fcgi_in_translate(UConn* c, UResp* err);   /* 1=ready, 0=need more, -1=err filled */
+void fcgi_in_response(uint16_t id, const UResp* resp, int send_body, UBuf* out);
+/* walk FastCGI name/value pairs; f returns nonzero to stop.  -1 on malformed */
+int  fcgi_each_param(const char* raw, size_t n,
+                     int (*f)(void* ctx, const char* k, size_t kl, const char* v, size_t vl), void* ctx);
 
 /* access log */
 void alog_write(const UReq* req, int status, size_t bytes, double ms);

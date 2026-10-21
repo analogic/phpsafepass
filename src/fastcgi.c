@@ -289,7 +289,22 @@ int fastcgi_forward(int sock_fd, UReq* req, UResp* resp,
     add_param(&params, "REQUEST_URI", req->uri);
     add_param(&params, "QUERY_STRING", req->query);
     add_param(&params, "DOCUMENT_ROOT", document_root);
-    add_param(&params, "SCRIPT_FILENAME", script_filename);
+    /* frameworks derive the route from these (nginx's fastcgi_params);
+       /x.php/a/b splits into script /x.php and PATH_INFO /a/b */
+    char sf[4096];
+    snprintf(sf, sizeof sf, "%s", script_filename);
+    char* pi = strstr(sf, ".php/");
+    char path_info[4096] = "";
+    if (pi) { snprintf(path_info, sizeof path_info, "%s", pi + 4); pi[4] = 0; }
+    add_param(&params, "SCRIPT_FILENAME", sf);
+    char script_name[4096];
+    const char* rel = sf + strlen(document_root);
+    snprintf(script_name, sizeof script_name, "%s%s", *rel == '/' ? "" : "/", rel);
+    add_param(&params, "SCRIPT_NAME", script_name);
+    add_param(&params, "PATH_INFO", path_info);
+    char self[8192];
+    snprintf(self, sizeof self, "%s%s", script_name, path_info);
+    add_param(&params, "PHP_SELF", self);
     add_param(&params, "SERVER_PROTOCOL", "HTTP/1.1");
     add_param(&params, "SERVER_NAME", ureq_header(req, "host"));
     add_param(&params, "REMOTE_ADDR", req->remote_ip);

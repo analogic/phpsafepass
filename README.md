@@ -9,6 +9,28 @@ reaches PHP. A small static binary, no runtime dependencies.
 It's not a substitute for patching or upgrading PHP, but on an old or
 end-of-life version you can't fix today, it can buy you some time.
 
+## Where it sits
+
+Today the web server speaks FastCGI straight to PHP-FPM:
+
+```
+   ┌──────────────────────┐    FastCGI    ┌───────────┐
+   │  nginx / Apache / …   │ ────────────► │  PHP-FPM  │
+   └──────────────────────┘               └───────────┘
+```
+
+phpsafepass drops in between — same FastCGI on both sides, nothing else to
+change — and checks every request before PHP ever sees it:
+
+```
+   ┌──────────────────────┐   FastCGI   ┌───────────────┐   FastCGI   ┌───────────┐
+   │  nginx / Apache / …   │ ──────────► │  phpsafepass  │ ──────────► │  PHP-FPM  │
+   └──────────────────────┘             └───────┬───────┘             └───────────┘
+                                                │
+                                                ╳  malformed or dangerous request:
+                                                   rejected with 400, never reaches PHP
+```
+
 ## Why
 
 PHP's C-level request parsers have repeatedly had critical bugs reachable

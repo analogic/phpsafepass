@@ -309,6 +309,19 @@ fn end_to_end() {
         assert!(fpm.seen.lock().unwrap().is_empty(), "request leaked to backend");
     }
 
+    // a non-multipart reject also travels end-to-end: urlencoded with too
+    // many fields (allocation-explosion guard) is refused before the backend
+    fpm.seen.lock().unwrap().clear();
+    let mut many = apache();
+    many[0].1 = "POST";
+    many[1].1 = "/info.php";
+    many.push(("CONTENT_TYPE", "application/x-www-form-urlencoded"));
+    let huge = vec!["a=1"; 1001].join("&");
+    many.push(("CONTENT_LENGTH", Box::leak(huge.len().to_string().into_boxed_str())));
+    let (st, _, ended) = talk(&mut conn(lp), &build_request(&many, huge.as_bytes(), 1, 0));
+    assert_eq!((st, ended), (400, true));
+    assert!(fpm.seen.lock().unwrap().is_empty());
+
     // keep-alive: several requests on one connection
     fpm.seen.lock().unwrap().clear();
     let mut s = conn(lp);

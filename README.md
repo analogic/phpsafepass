@@ -33,34 +33,47 @@ change — and checks every request before PHP ever sees it:
 
 ## Why
 
-PHP's C-level request parsers have repeatedly had critical bugs reachable
-straight from a crafted HTTP request — the multipart parser and the
-`session.upload_progress` handler among them. phpsafepass closes that path
-without signatures:
+phpsafepass does two things, and it's worth being precise about each:
 
-- **multipart** bodies are fully parsed and re-serialized with a fresh
-  random boundary, so PHP's parser only ever sees bytes phpsafepass wrote;
-- the `PHP_SESSION_UPLOAD_PROGRESS` trigger field is rejected outright.
+1. **Re-serializes multipart bodies.** Every `multipart/form-data` body is
+   fully parsed and re-emitted with a fresh boundary, so PHP's multipart
+   parser only ever sees bytes phpsafepass wrote — not the client's. This
+   closes classic *parser-differential* multipart bugs (e.g. CVE-2024-3096).
+2. **Caps the shapes that drive the 2026 bugs.** It limits the number of form
+   fields and how deeply field names nest (`a[b][c]…`), on both multipart and
+   urlencoded bodies, and rejects the `PHP_SESSION_UPLOAD_PROGRESS` field.
 
-Everything else — GET, JSON, urlencoded, any other content type — is
-forwarded byte-for-byte unchanged. phpsafepass is **not** a WAF and does not
-try to be: it neutralizes exactly the multipart parser path (the one with a
-history of pre-auth memory-safety bugs) and otherwise stays out of the way.
-It leans on PHP's own limits (`max_input_vars`, `post_max_size`, …) for the
-rest rather than second-guessing them.
+Everything else — GET, JSON, any other content type — is forwarded
+byte-for-byte unchanged. phpsafepass is **not** a WAF, has no signatures, and
+stays out of the way otherwise.
 
-### CVEs this targets
+### On CVE-2026-109618 / CVE-2026-109619 (the "php2shell" pair)
 
-- **CVE-2026-109618** — use-after-free in the `session.upload_progress`
-  handler (the `PHP_SESSION_UPLOAD_PROGRESS` field is rejected)
-- **CVE-2026-109619** — use-after-free in the multipart form-data parser
-  (multipart bodies are re-serialized, so PHP never parses attacker bytes)
+Be honest with yourself about these: they are **not** malformed-byte parser
+bugs. They are state-corruption-on-fatal-error bugs — a fatal (typically
+`memory_limit` exhausted during allocation) interrupts parsing and leaves
+dangling state that request shutdown then frees and a later request reclaims,
+leading to RCE. The triggers are *memory pressure* and *allocation
+explosion* (many fields, deeply nested field names, `filename=""` parts),
+plus the upload-progress path — see the
+[write-up](https://calif.io/php2shell/).
 
-These two are the "php2shell" pair. The same two mechanisms also cover
-earlier bugs of the same shape — the multipart parser (e.g. CVE-2024-3096)
-and the upload-progress handler (e.g. CVE-2024-11236). It does **not**
-address PHP bugs outside the request parsers, such as the SOAP
-use-after-free (CVE-2026-6722).
+So re-serializing "clean" multipart bytes does **not** fix them: a perfectly
+well-formed body with thousands of deeply nested field names triggers the bug
+just the same. What phpsafepass does is **partial hardening**: the field-count
+and nesting caps blunt the allocation explosion, a tight `MAX_REQUEST` bounds
+the memory a request can drive PHP to allocate, and the upload-progress field
+is refused. That raises the bar; it does not remove the vulnerability.
+
+**This is not a fix. Patch PHP** (October 2026 security release), and apply
+the upstream mitigations (`session.upload_progress.enabled=0`,
+`memory_limit=-1`) where you can't patch yet. phpsafepass only buys time, and
+only partially — it does nothing for the `unserialize()`/`session_start()`
+variant or for PHP bugs outside request parsing (e.g. the SOAP UAF,
+CVE-2026-6722).
+
+> **Tune it for this to matter:** set `MAX_REQUEST` at or near your PHP
+> `post_max_size` (default 8M). Left at 64M, the memory-pressure bound is weak.
 
 ## Written in Rust
 

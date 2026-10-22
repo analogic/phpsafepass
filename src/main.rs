@@ -19,7 +19,7 @@ use std::time::Duration;
 use phpsafepass::check::{self, Outcome};
 use phpsafepass::fcgi;
 
-const MAX_REQUEST: usize = 64 << 20; // params + body
+const DEFAULT_MAX_REQUEST: usize = 64 << 20; // params + body; override on the CLI
 const CLIENT_TIMEOUT: u64 = 60; // s, Apache → us
 const UPSTREAM_TIMEOUT: u64 = 600; // s, PHP may run long
 
@@ -139,7 +139,7 @@ fn build_rewrite(id: u16, keep: bool, params: &[(&[u8], &[u8])], new_ct: &str, n
 /// Serve one request. Returns Ok(true) if the connection may carry another
 /// (keep-alive), Ok(false) to close. The client's `BufReader` is reused
 /// across keep-alive requests so bytes read ahead are not lost.
-fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str) -> io::Result<bool> {
+fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str, max_request: usize) -> io::Result<bool> {
     let mut raw = Vec::new();
     let mut params_buf = Vec::new();
     let mut body = Vec::new();
@@ -155,7 +155,7 @@ fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str) -> io::Res
             Err(_) => return Ok(false),
         };
         id = rid;
-        if raw.len() > MAX_REQUEST {
+        if raw.len() > max_request {
             return Ok(false);
         }
         match t {
@@ -248,10 +248,22 @@ fn param<'a>(pairs: &'a [(&'a [u8], &'a [u8])], name: &[u8]) -> std::borrow::Cow
         .unwrap_or(std::borrow::Cow::Borrowed("-"))
 }
 
-fn serve(client: Box<dyn Stream>, upstream: Arc<String>) {
+fn serve(client: Box<dyn Stream>, upstream: Arc<String>, max_request: usize) {
     client.tune(CLIENT_TIMEOUT);
     let mut reader = BufReader::new(client);
-    while let Ok(true) = serve_one(&mut reader, &upstream) {}
+    while let Ok(true) = serve_one(&mut reader, &upstream, max_request) {}
+}
+
+/// Parse a byte size like `64M`, `128m`, `1G`, `1024K`, or a plain byte count.
+fn parse_size(s: &str) -> Option<usize> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last()? {
+        b'k' | b'K' => (&s[..s.len() - 1], 1024),
+        b'm' | b'M' => (&s[..s.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
 /// `--health TARGET`: exit 0 if we can open a connection to TARGET, else 1.
@@ -265,14 +277,25 @@ fn main() {
     if args.len() == 3 && args[1] == "--health" {
         health(&args[2]);
     }
-    if args.len() != 3 {
-        eprintln!("usage: phpsafepass LISTEN UPSTREAM");
+    if args.len() < 3 || args.len() > 4 {
+        eprintln!("usage: phpsafepass LISTEN UPSTREAM [MAX_REQUEST]");
         eprintln!("       phpsafepass --health TARGET");
         eprintln!("  LISTEN, UPSTREAM, TARGET: host:port or /path/to.sock");
+        eprintln!("  MAX_REQUEST: max buffered request size, e.g. 64M (default), 128M, 512K");
         std::process::exit(2);
     }
     let listen = args[1].clone();
     let upstream = Arc::new(args[2].clone());
+    let max_request = match args.get(3) {
+        None => DEFAULT_MAX_REQUEST,
+        Some(s) => match parse_size(s) {
+            Some(n) => n,
+            None => {
+                eprintln!("[phpsafepass] bad MAX_REQUEST: {s}");
+                std::process::exit(2);
+            }
+        },
+    };
 
     let listener = match Listener::bind(&listen) {
         Ok(l) => l,
@@ -281,15 +304,33 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("[phpsafepass] {listen} -> {upstream}");
+    eprintln!("[phpsafepass] {listen} -> {upstream} (max request {max_request} B)");
 
     loop {
         match listener.accept() {
             Ok(client) => {
                 let up = Arc::clone(&upstream);
-                std::thread::spawn(move || serve(client, up));
+                std::thread::spawn(move || serve(client, up, max_request));
             }
             Err(_) => continue,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn parse_size_units_and_bytes() {
+        assert_eq!(parse_size("64M"), Some(64 << 20));
+        assert_eq!(parse_size("128m"), Some(128 << 20));
+        assert_eq!(parse_size("1G"), Some(1 << 30));
+        assert_eq!(parse_size("512K"), Some(512 << 10));
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("  32M "), Some(32 << 20));
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("abc"), None);
+        assert_eq!(parse_size("M"), None);
     }
 }

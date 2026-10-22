@@ -301,9 +301,6 @@ fn end_to_end() {
         (mp(xx), &b"--XX\r\nX-H: 1\r\n\r\nhi\r\n--XX--\r\n"[..]),
         (mp(xx), &b"--XX\r\nContent-Disposition: form-data\r\n\r\nhi\r\n--XX--\r\n"[..]),
         (mp(xx), &b"--XX\r\nContent-Disposition: form-data; name=\"a\\\"b\"\r\n\r\nhi\r\n--XX--\r\n"[..]),
-        (json_post("6"), &b"{\"a\":["[..]),
-        (crlf_headers(), &b""[..]),
-        (nul_query(), &b""[..]),
     ];
     for (params, body) in rejects {
         fpm.seen.lock().unwrap().clear();
@@ -336,35 +333,6 @@ fn backend_down_502() {
 }
 
 // ── small builders kept out of the body for readability ───────────────────
-
-fn json_post(clen: &'static str) -> Vec<(&'static str, &'static str)> {
-    let mut p = apache();
-    p[0].1 = "POST";
-    p[1].1 = "/info.php";
-    p.push(("CONTENT_TYPE", "application/json"));
-    p.push(("CONTENT_LENGTH", clen));
-    p
-}
-
-fn crlf_headers() -> Vec<(&'static str, &'static str)> {
-    let mut p = apache();
-    for kv in p.iter_mut() {
-        if kv.0 == "HTTP_USER_AGENT" {
-            kv.1 = "x\r\nX-Evil: 1";
-        }
-    }
-    p
-}
-
-fn nul_query() -> Vec<(&'static str, &'static str)> {
-    let mut p = apache();
-    for kv in p.iter_mut() {
-        if kv.0 == "QUERY_STRING" {
-            kv.1 = "a\0b";
-        }
-    }
-    p
-}
 
 fn borrow(p: &[(Vec<u8>, Vec<u8>)]) -> Vec<(&[u8], &[u8])> {
     p.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect()

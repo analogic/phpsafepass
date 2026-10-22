@@ -40,12 +40,14 @@ without signatures:
 
 - **multipart** bodies are fully parsed and re-serialized with a fresh
   random boundary, so PHP's parser only ever sees bytes phpsafepass wrote;
-- the `PHP_SESSION_UPLOAD_PROGRESS` trigger field is rejected outright;
-- requests with ambiguous framing, bare CR/LF, NUL bytes, or structurally
-  broken multipart or JSON bodies are refused before the backend.
+- the `PHP_SESSION_UPLOAD_PROGRESS` trigger field is rejected outright.
 
-Everything else (GET, JSON, urlencoded, other content types) is checked and
-forwarded byte-for-byte unchanged.
+Everything else — GET, JSON, urlencoded, any other content type — is
+forwarded byte-for-byte unchanged. phpsafepass is **not** a WAF and does not
+try to be: it neutralizes exactly the multipart parser path (the one with a
+history of pre-auth memory-safety bugs) and otherwise stays out of the way.
+It leans on PHP's own limits (`max_input_vars`, `post_max_size`, …) for the
+rest rather than second-guessing them.
 
 ### CVEs this targets
 
@@ -125,11 +127,14 @@ services:
 ## Run
 
 ```
-phpsafepass LISTEN UPSTREAM
+phpsafepass LISTEN UPSTREAM [MAX_REQUEST]
 ```
 
 `LISTEN` and `UPSTREAM` are each `host:port` or `/path/to.sock`. phpsafepass
 listens where the web server connects, and forwards to the PHP-FPM pool.
+`MAX_REQUEST` caps the buffered request size (params + body) to protect the
+proxy's own memory — e.g. `64M` (default), `128M`, `512K`, or a plain byte
+count.
 
 ```bash
 # TCP both sides

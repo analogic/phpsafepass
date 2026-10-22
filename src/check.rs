@@ -18,55 +18,24 @@ pub enum Outcome {
     Reject { status: u16, msg: &'static str },
 }
 
-const JSON_MAX_DEPTH: i32 = 32;
-const JSON_MAX_STRING: usize = 1 << 20;
-const MAX_HEADERS: usize = 128;
 const MAX_PARTS: usize = 256;
 
 /// Check one request. `params` are the decoded FastCGI name/value pairs,
 /// `body` the concatenated STDIN.
 pub fn check(params: &[(&[u8], &[u8])], body: &[u8]) -> Outcome {
-    let mut content_type: Option<&[u8]> = None;
-    let mut nheaders = 0usize;
-
-    for &(k, v) in params {
-        // PHP reads these as C strings: an embedded NUL would make it see
-        // less than we checked.
-        if k.contains(&0) || v.contains(&0) {
-            return Outcome::Reject { status: 400, msg: "NUL byte in FastCGI param" };
-        }
-        let is_ct = k == b"CONTENT_TYPE";
-        let is_http = k.len() > 5 && &k[..5] == b"HTTP_";
-        if is_ct || is_http {
-            // CR/LF has no business in a header value (would smuggle a header)
-            if v.contains(&b'\r') || v.contains(&b'\n') {
-                return Outcome::Reject { status: 400, msg: "CR/LF in header value" };
-            }
-            nheaders += 1;
-            if nheaders > MAX_HEADERS {
-                return Outcome::Reject { status: 400, msg: "too many headers" };
-            }
-        }
-        if is_ct {
-            content_type = Some(v);
-        }
-    }
+    // Only multipart is rewritten; everything else is forwarded verbatim, so
+    // the one param we need is CONTENT_TYPE, to spot a multipart body.
+    let content_type = params.iter().find(|(k, _)| *k == b"CONTENT_TYPE").map(|(_, v)| *v);
 
     if let Some(ct) = content_type {
         if !body.is_empty() {
             if let Some(base) = media_base(ct) {
-                let base = base.as_slice();
-                if base == b"multipart/form-data" {
+                if base.as_slice() == b"multipart/form-data" {
                     return match sanitize_multipart(ct, body) {
                         Ok((nct, nbody)) => Outcome::Rewrite { content_type: nct, body: nbody },
                         Err((status, msg)) => Outcome::Reject { status, msg },
                     };
-                } else if base == b"application/json" {
-                    if let Err((status, msg)) = sanitize_json(body) {
-                        return Outcome::Reject { status, msg };
-                    }
                 }
-                // other content types (urlencoded, text, ...) pass through as-is
             }
         }
     }
@@ -242,60 +211,6 @@ fn mp_param(header: &[u8], param: &str) -> Option<Vec<u8>> {
         }
         return Some(header[s..i].to_vec());
     }
-}
-
-// ── JSON ─────────────────────────────────────────────────────────────────
-
-/// Walk the bytes enforcing nesting depth, string length, and overall
-/// balance — enough to reject the malformed input a differential parser
-/// bug feeds on, without building a tree.
-fn sanitize_json(body: &[u8]) -> Result<(), (u16, &'static str)> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut slen = 0usize;
-    let mut i = 0;
-    while i < body.len() {
-        let c = body[i];
-        if in_string {
-            if c == b'\\' {
-                i += 2;
-                slen += 2;
-                continue;
-            }
-            if c == b'"' {
-                if slen > JSON_MAX_STRING {
-                    return Err((400, "JSON string too long"));
-                }
-                in_string = false;
-            } else {
-                slen += 1;
-            }
-        } else {
-            match c {
-                b'"' => {
-                    in_string = true;
-                    slen = 0;
-                }
-                b'{' | b'[' => {
-                    depth += 1;
-                    if depth > JSON_MAX_DEPTH {
-                        return Err((400, "JSON nesting too deep"));
-                    }
-                }
-                b'}' | b']' => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    if in_string || depth != 0 {
-        return Err((400, "Malformed JSON"));
-    }
-    Ok(())
 }
 
 // ── byte helpers ───────────────────────────────────────────────────────
@@ -474,38 +389,6 @@ mod tests {
     fn mp_param_quoted_and_token() {
         assert_eq!(mp_param(b"multipart/form-data; boundary=abc123", "boundary").unwrap(), *b"abc123");
         assert_eq!(mp_param(b"form-data; name=\"a b\"", "name").unwrap(), *b"a b");
-    }
-
-    #[test]
-    fn reject_bad_json() {
-        let p = pairs(&[("CONTENT_TYPE", "application/json")]);
-        assert_eq!(reject_status(check(&p, b"{\"a\":[")), 400);
-        assert_eq!(reject_status(check(&p, b"{\"a\":\"unterminated")), 400);
-    }
-
-    #[test]
-    fn json_escaped_quote_is_valid() {
-        let p = pairs(&[("CONTENT_TYPE", "application/json")]);
-        assert!(matches!(check(&p, b"{\"a\":\"he said \\\"hi\\\"\"}"), Outcome::Pass));
-    }
-
-    #[test]
-    fn json_too_deep() {
-        let deep = "[".repeat(40);
-        let p = pairs(&[("CONTENT_TYPE", "application/json")]);
-        assert_eq!(reject_status(check(&p, deep.as_bytes())), 400);
-    }
-
-    #[test]
-    fn reject_crlf_in_header() {
-        let p = pairs(&[("HTTP_USER_AGENT", "x\r\nX-Evil: 1")]);
-        assert_eq!(reject_status(check(&p, b"")), 400);
-    }
-
-    #[test]
-    fn reject_nul_in_param() {
-        let p = vec![(&b"QUERY_STRING"[..], &b"a\x00b"[..])];
-        assert_eq!(reject_status(check(&p, b"")), 400);
     }
 
     #[test]

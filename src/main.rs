@@ -138,7 +138,8 @@ fn serve_one(client: &mut dyn Stream, upstream: &str) -> io::Result<bool> {
     let mut raw = Vec::new();
     let mut params_buf = Vec::new();
     let mut body = Vec::new();
-    let mut id = 1u16;
+    #[allow(unused_assignments)]
+    let mut id = 1u16; // FastCGI request id; the records below set the real one
     let mut keep = false;
     let mut begun = false;
 

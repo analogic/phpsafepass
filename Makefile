@@ -3,7 +3,7 @@
 
 MUSL_TARGET := x86_64-unknown-linux-musl
 
-.PHONY: all static test clean
+.PHONY: all static test docker clean
 
 all:
 	cargo build --release
@@ -16,6 +16,9 @@ static:
 
 test:
 	cargo test
+
+docker:
+	docker build -t phpsafepass .
 
 clean:
 	cargo clean

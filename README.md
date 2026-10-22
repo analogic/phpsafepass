@@ -53,6 +53,29 @@ make static                    # target/x86_64-unknown-linux-musl/release/phpsaf
 cargo test                     # unit + end-to-end tests
 ```
 
+## Docker
+
+A rolling `edge` image (scratch + the static binary, ~500 KB) is published
+to GHCR on every push — no version tags, `edge` and `latest` always point at
+the newest build:
+
+```bash
+docker pull ghcr.io/analogic/phpsafepass:edge
+# phpsafepass LISTEN UPSTREAM
+docker run -p 9000:9000 ghcr.io/analogic/phpsafepass:edge 0.0.0.0:9000 php-fpm:9000
+```
+
+As a compose service in front of a PHP-FPM pool:
+
+```yaml
+services:
+  phpsafepass:
+    image: ghcr.io/analogic/phpsafepass:edge
+    command: ["0.0.0.0:9000", "php-fpm:9000"]
+    ports:
+      - "9000:9000"
+```
+
 ## Run
 
 ```

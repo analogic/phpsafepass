@@ -107,6 +107,7 @@ fn fake_fpm() -> FakeFpm {
             std::thread::spawn(move || {
                 let mut params = Vec::new();
                 let mut stdin = Vec::new();
+                #[allow(unused_assignments)]
                 let mut rid = 1u16;
                 loop {
                     match read_record(&mut c) {

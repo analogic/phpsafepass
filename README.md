@@ -42,7 +42,7 @@ without signatures:
   random boundary, so PHP's parser only ever sees bytes phpsafepass wrote;
 - the `PHP_SESSION_UPLOAD_PROGRESS` trigger field is rejected outright;
 - requests with ambiguous framing, bare CR/LF, NUL bytes, or structurally
-  broken multipart/JSON/form bodies are refused before the backend.
+  broken multipart or JSON bodies are refused before the backend.
 
 Everything else (GET, JSON, urlencoded, other content types) is checked and
 forwarded byte-for-byte unchanged.

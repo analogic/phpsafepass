@@ -20,8 +20,6 @@ pub enum Outcome {
 
 const JSON_MAX_DEPTH: i32 = 32;
 const JSON_MAX_STRING: usize = 1 << 20;
-const URLENC_MAX_PARAMS: i32 = 128;
-const URLENC_MAX_VALUE: usize = 64 << 10;
 const MAX_HEADERS: usize = 128;
 const MAX_PARTS: usize = 256;
 
@@ -67,12 +65,8 @@ pub fn check(params: &[(&[u8], &[u8])], body: &[u8]) -> Outcome {
                     if let Err((status, msg)) = sanitize_json(body) {
                         return Outcome::Reject { status, msg };
                     }
-                } else if base == b"application/x-www-form-urlencoded" {
-                    if let Err((status, msg)) = sanitize_urlencoded(body) {
-                        return Outcome::Reject { status, msg };
-                    }
                 }
-                // other content types pass through as-is
+                // other content types (urlencoded, text, ...) pass through as-is
             }
         }
     }
@@ -304,38 +298,6 @@ fn sanitize_json(body: &[u8]) -> Result<(), (u16, &'static str)> {
     Ok(())
 }
 
-// ── urlencoded ─────────────────────────────────────────────────────────
-
-/// Validate `a=1&b=2` framing (param count, value size). The body is
-/// forwarded verbatim; this only rejects the pathological shapes.
-fn sanitize_urlencoded(body: &[u8]) -> Result<(), (u16, &'static str)> {
-    let mut params = 0i32;
-    let mut p = 0;
-    while p < body.len() {
-        let rel = find(&body[p..], b"&");
-        let pairlen = rel.unwrap_or(body.len() - p);
-        if pairlen > 0 {
-            params += 1;
-            if params > URLENC_MAX_PARAMS {
-                return Err((400, "Too many form parameters"));
-            }
-            let pair = &body[p..p + pairlen];
-            let vlen = match find(pair, b"=") {
-                Some(eq) => pairlen - (eq + 1),
-                None => 0,
-            };
-            if vlen > URLENC_MAX_VALUE {
-                return Err((400, "Form parameter value too large"));
-            }
-        }
-        p += pairlen;
-        if rel.is_some() {
-            p += 1; // skip '&'
-        }
-    }
-    Ok(())
-}
-
 // ── byte helpers ───────────────────────────────────────────────────────
 
 fn trim_lead_space(mut s: &[u8]) -> &[u8] {
@@ -547,10 +509,12 @@ mod tests {
     }
 
     #[test]
-    fn urlencoded_too_many_params() {
-        let many = vec!["a=1"; 200].join("&");
+    fn urlencoded_forwarded_verbatim_even_when_huge() {
+        // no param-count limit: urlencoded is passed straight through (PHP's
+        // own max_input_vars/post_max_size guard it)
+        let many = vec!["a=1"; 2000].join("&");
         let p = pairs(&[("CONTENT_TYPE", "application/x-www-form-urlencoded")]);
-        assert_eq!(reject_status(check(&p, many.as_bytes())), 400);
+        assert!(matches!(check(&p, many.as_bytes()), Outcome::Pass));
     }
 
     #[test]

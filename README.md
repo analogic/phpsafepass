@@ -73,6 +73,19 @@ Deliberately, not for fashion:
 - **One small static binary.** A musl build links statically and drops into a
   `scratch` container (~500 KB), with no runtime to install anywhere.
 
+## Download
+
+A prebuilt static binary for x86-64 Linux is attached to the rolling `edge`
+release — always the latest build of `main`, no version to pick:
+
+```bash
+curl -L -o phpsafepass \
+  https://github.com/analogic/phpsafepass/releases/download/edge/phpsafepass-x86_64-linux
+chmod +x phpsafepass
+```
+
+Or build it yourself (or pull the Docker image, below).
+
 ## Build
 
 ```bash

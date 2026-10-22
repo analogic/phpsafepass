@@ -1,0 +1,19 @@
+[package]
+name = "phpsafepass"
+version = "0.1.0"
+edition = "2021"
+description = "A checking FastCGI pass-through between a web server and PHP-FPM"
+
+[[bin]]
+name = "phpsafepass"
+path = "src/main.rs"
+
+[lib]
+name = "phpsafepass"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

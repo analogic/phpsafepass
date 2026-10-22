@@ -4,7 +4,7 @@ A checking FastCGI pass-through that sits between your web server and
 PHP-FPM. It reads each request, validates it structurally, and forwards
 only what passes — multipart bodies are re-serialized so PHP never parses
 the attacker's bytes. Anything malformed is rejected with `400` and never
-reaches PHP. A tiny static binary (~100 KB), no dependencies.
+reaches PHP. A small static binary, no runtime dependencies.
 
 It's not a substitute for patching or upgrading PHP, but on an old or
 end-of-life version you can't fix today, it can buy you some time.
@@ -40,11 +40,17 @@ use-after-free (CVE-2026-6722).
 
 ## Build
 
+Written in Rust, standard library only — no crate dependencies.
+
 ```bash
-make                 # build/phpsafepass          (dynamic, development)
+cargo build --release          # target/release/phpsafepass
+
+# static, dependency-free binary for deploy:
 sudo apt install musl-tools
-make static          # build/phpsafepass-static   (static, deploy)
-make test            # build static + run the test suite
+rustup target add x86_64-unknown-linux-musl
+make static                    # target/x86_64-unknown-linux-musl/release/phpsafepass
+
+cargo test                     # unit + end-to-end tests
 ```
 
 ## Run

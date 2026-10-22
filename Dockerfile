@@ -13,5 +13,9 @@ FROM scratch
 COPY --from=build /src/target/release/phpsafepass /phpsafepass
 # phpsafepass LISTEN UPSTREAM — override at `docker run`:
 #   docker run -p 9000:9000 IMAGE 0.0.0.0:9000 php-fpm:9000
+# Healthcheck connects to the listen port (default 9000); override it too if
+# you change the listen port.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=2s \
+    CMD ["/phpsafepass", "--health", "127.0.0.1:9000"]
 ENTRYPOINT ["/phpsafepass"]
 CMD ["0.0.0.0:9000", "127.0.0.1:9001"]

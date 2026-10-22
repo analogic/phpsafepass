@@ -1,6 +1,7 @@
 //! phpsafepass — a checking FastCGI pass-through, Apache → PHP-FPM.
 //!
 //!   phpsafepass LISTEN UPSTREAM        (each: host:port or /path/to.sock)
+//!   phpsafepass --health TARGET        (exit 0 if TARGET accepts a connection)
 //!
 //! Reads one FastCGI request, runs the structural check, and if it passes
 //! forwards the ORIGINAL bytes untouched — so Apache's params (SCRIPT_FILENAME,
@@ -8,7 +9,7 @@
 //! re-serialized first so PHP never parses the attacker's bytes. A request
 //! that fails the check gets an error status from here and never reaches PHP.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -22,20 +23,23 @@ const MAX_REQUEST: usize = 64 << 20; // params + body
 const CLIENT_TIMEOUT: u64 = 60; // s, Apache → us
 const UPSTREAM_TIMEOUT: u64 = 600; // s, PHP may run long
 
-/// A client or upstream connection, TCP or Unix, with timeouts.
+/// A client or upstream connection, TCP or Unix.
 trait Stream: Read + Write + Send {
-    fn set_timeouts(&self, secs: u64);
+    /// Set read/write timeouts and, for TCP, disable Nagle (we send whole
+    /// requests/records at once, so Nagle only adds latency).
+    fn tune(&self, timeout_secs: u64);
 }
 impl Stream for TcpStream {
-    fn set_timeouts(&self, secs: u64) {
-        let d = Some(Duration::from_secs(secs));
+    fn tune(&self, s: u64) {
+        let d = Some(Duration::from_secs(s));
         let _ = self.set_read_timeout(d);
         let _ = self.set_write_timeout(d);
+        let _ = self.set_nodelay(true);
     }
 }
 impl Stream for UnixStream {
-    fn set_timeouts(&self, secs: u64) {
-        let d = Some(Duration::from_secs(secs));
+    fn tune(&self, s: u64) {
+        let d = Some(Duration::from_secs(s));
         let _ = self.set_read_timeout(d);
         let _ = self.set_write_timeout(d);
     }
@@ -101,10 +105,10 @@ fn read_record<R: Read + ?Sized>(r: &mut R, raw: &mut Vec<u8>) -> io::Result<(u8
     Ok((t, id, buf))
 }
 
-fn send_reject(client: &mut dyn Stream, id: u16, status: u16, body: &[u8]) {
+fn send_reject<W: Write>(w: &mut W, id: u16, status: u16, body: &[u8]) {
     let mut out = Vec::new();
     fcgi::response(&mut out, id, status, body);
-    let _ = client.write_all(&out);
+    let _ = w.write_all(&out);
 }
 
 /// Rebuild a FastCGI request for a re-serialized multipart body, copying
@@ -133,8 +137,9 @@ fn build_rewrite(id: u16, keep: bool, params: &[(&[u8], &[u8])], new_ct: &str, n
 }
 
 /// Serve one request. Returns Ok(true) if the connection may carry another
-/// (keep-alive), Ok(false) to close.
-fn serve_one(client: &mut dyn Stream, upstream: &str) -> io::Result<bool> {
+/// (keep-alive), Ok(false) to close. The client's `BufReader` is reused
+/// across keep-alive requests so bytes read ahead are not lost.
+fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str) -> io::Result<bool> {
     let mut raw = Vec::new();
     let mut params_buf = Vec::new();
     let mut body = Vec::new();
@@ -179,44 +184,53 @@ fn serve_one(client: &mut dyn Stream, upstream: &str) -> io::Result<bool> {
     let pairs = match fcgi::parse_params(&params_buf) {
         Some(p) => p,
         None => {
-            send_reject(client, id, 400, b"Bad Request: malformed FastCGI params");
+            send_reject(client.get_mut(), id, 400, b"Bad Request: malformed FastCGI params");
             return Ok(keep);
         }
     };
 
-    let forward: Vec<u8> = match check::check(&pairs, &body) {
+    // Only re-serialized multipart gets a new buffer; everything else is
+    // forwarded straight from `raw` with no copy.
+    let rebuilt: Option<Vec<u8>> = match check::check(&pairs, &body) {
         Outcome::Reject { status, msg } => {
-            let method = param(&pairs, b"REQUEST_METHOD");
-            let uri = param(&pairs, b"REQUEST_URI");
-            eprintln!("[phpsafepass] rejected {status} {method} {uri}: {msg}");
-            send_reject(client, id, status, msg.as_bytes());
+            eprintln!(
+                "[phpsafepass] rejected {status} {} {}: {msg}",
+                param(&pairs, b"REQUEST_METHOD"),
+                param(&pairs, b"REQUEST_URI")
+            );
+            send_reject(client.get_mut(), id, status, msg.as_bytes());
             return Ok(keep);
         }
-        Outcome::Pass => raw,
-        Outcome::Rewrite { content_type, body: nb } => build_rewrite(id, keep, &pairs, &content_type, &nb),
+        Outcome::Pass => None,
+        Outcome::Rewrite { content_type, body: nb } => {
+            Some(build_rewrite(id, keep, &pairs, &content_type, &nb))
+        }
     };
+    let forward: &[u8] = rebuilt.as_deref().unwrap_or(&raw);
 
     let mut up = match dial(upstream) {
         Some(s) => s,
         None => {
             eprintln!("[phpsafepass] cannot reach {upstream}");
-            send_reject(client, id, 502, b"Bad Gateway");
+            send_reject(client.get_mut(), id, 502, b"Bad Gateway");
             return Ok(keep);
         }
     };
-    up.set_timeouts(UPSTREAM_TIMEOUT);
-    if up.write_all(&forward).is_err() {
+    up.tune(UPSTREAM_TIMEOUT);
+    if up.write_all(forward).is_err() {
         return Ok(false);
     }
 
-    // Relay the response record by record until END_REQUEST.
+    // Relay the response record by record until END_REQUEST. Buffered reads
+    // cut syscalls; writes go straight out (NODELAY) so streaming stays live.
+    let mut up = BufReader::new(up);
     loop {
         let mut rec = Vec::new();
-        let t = match read_record(&mut *up, &mut rec) {
+        let t = match read_record(&mut up, &mut rec) {
             Ok((t, _, _)) => t,
             Err(_) => return Ok(false),
         };
-        if client.write_all(&rec).is_err() {
+        if client.get_mut().write_all(&rec).is_err() {
             return Ok(false);
         }
         if t == fcgi::END_REQUEST {
@@ -234,16 +248,27 @@ fn param<'a>(pairs: &'a [(&'a [u8], &'a [u8])], name: &[u8]) -> std::borrow::Cow
         .unwrap_or(std::borrow::Cow::Borrowed("-"))
 }
 
-fn serve(mut client: Box<dyn Stream>, upstream: Arc<String>) {
-    client.set_timeouts(CLIENT_TIMEOUT);
-    while let Ok(true) = serve_one(&mut *client, &upstream) {}
+fn serve(client: Box<dyn Stream>, upstream: Arc<String>) {
+    client.tune(CLIENT_TIMEOUT);
+    let mut reader = BufReader::new(client);
+    while let Ok(true) = serve_one(&mut reader, &upstream) {}
+}
+
+/// `--health TARGET`: exit 0 if we can open a connection to TARGET, else 1.
+/// Lets a scratch image have a HEALTHCHECK without a shell.
+fn health(target: &str) -> ! {
+    std::process::exit(if dial(target).is_some() { 0 } else { 1 });
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--health" {
+        health(&args[2]);
+    }
     if args.len() != 3 {
         eprintln!("usage: phpsafepass LISTEN UPSTREAM");
-        eprintln!("  LISTEN, UPSTREAM: host:port or /path/to.sock");
+        eprintln!("       phpsafepass --health TARGET");
+        eprintln!("  LISTEN, UPSTREAM, TARGET: host:port or /path/to.sock");
         std::process::exit(2);
     }
     let listen = args[1].clone();

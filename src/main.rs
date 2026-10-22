@@ -1,7 +1,8 @@
 //! phpsafepass — a checking FastCGI pass-through, Apache → PHP-FPM.
 //!
-//!   phpsafepass LISTEN UPSTREAM        (each: host:port or /path/to.sock)
+//!   phpsafepass LISTEN UPSTREAM [--max-request S] [--max-fields N] [--max-depth N]
 //!   phpsafepass --health TARGET        (exit 0 if TARGET accepts a connection)
+//!   (LISTEN/UPSTREAM/TARGET: host:port or /path/to.sock)
 //!
 //! Reads one FastCGI request, runs the structural check, and if it passes
 //! forwards the ORIGINAL bytes untouched — so Apache's params (SCRIPT_FILENAME,
@@ -22,6 +23,13 @@ use phpsafepass::fcgi;
 const DEFAULT_MAX_REQUEST: usize = 64 << 20; // params + body; override on the CLI
 const CLIENT_TIMEOUT: u64 = 60; // s, Apache → us
 const UPSTREAM_TIMEOUT: u64 = 600; // s, PHP may run long
+
+/// Runtime knobs shared with every connection.
+#[derive(Clone, Copy)]
+struct Config {
+    max_request: usize,
+    limits: check::Limits,
+}
 
 /// A client or upstream connection, TCP or Unix.
 trait Stream: Read + Write + Send {
@@ -139,7 +147,7 @@ fn build_rewrite(id: u16, keep: bool, params: &[(&[u8], &[u8])], new_ct: &str, n
 /// Serve one request. Returns Ok(true) if the connection may carry another
 /// (keep-alive), Ok(false) to close. The client's `BufReader` is reused
 /// across keep-alive requests so bytes read ahead are not lost.
-fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str, max_request: usize) -> io::Result<bool> {
+fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str, cfg: Config) -> io::Result<bool> {
     let mut raw = Vec::new();
     let mut params_buf = Vec::new();
     let mut body = Vec::new();
@@ -155,7 +163,7 @@ fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str, max_reques
             Err(_) => return Ok(false),
         };
         id = rid;
-        if raw.len() > max_request {
+        if raw.len() > cfg.max_request {
             return Ok(false);
         }
         match t {
@@ -191,7 +199,7 @@ fn serve_one(client: &mut BufReader<Box<dyn Stream>>, upstream: &str, max_reques
 
     // Only re-serialized multipart gets a new buffer; everything else is
     // forwarded straight from `raw` with no copy.
-    let rebuilt: Option<Vec<u8>> = match check::check(&pairs, &body) {
+    let rebuilt: Option<Vec<u8>> = match check::check(&pairs, &body, cfg.limits) {
         Outcome::Reject { status, msg } => {
             eprintln!(
                 "[phpsafepass] rejected {status} {} {}: {msg}",
@@ -248,10 +256,10 @@ fn param<'a>(pairs: &'a [(&'a [u8], &'a [u8])], name: &[u8]) -> std::borrow::Cow
         .unwrap_or(std::borrow::Cow::Borrowed("-"))
 }
 
-fn serve(client: Box<dyn Stream>, upstream: Arc<String>, max_request: usize) {
+fn serve(client: Box<dyn Stream>, upstream: Arc<String>, cfg: Config) {
     client.tune(CLIENT_TIMEOUT);
     let mut reader = BufReader::new(client);
-    while let Ok(true) = serve_one(&mut reader, &upstream, max_request) {}
+    while let Ok(true) = serve_one(&mut reader, &upstream, cfg) {}
 }
 
 /// Parse a byte size like `64M`, `128m`, `1G`, `1024K`, or a plain byte count.
@@ -272,30 +280,78 @@ fn health(target: &str) -> ! {
     std::process::exit(if dial(target).is_some() { 0 } else { 1 });
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 && args[1] == "--health" {
-        health(&args[2]);
-    }
-    if args.len() < 3 || args.len() > 4 {
-        eprintln!("usage: phpsafepass LISTEN UPSTREAM [MAX_REQUEST]");
-        eprintln!("       phpsafepass --health TARGET");
-        eprintln!("  LISTEN, UPSTREAM, TARGET: host:port or /path/to.sock");
-        eprintln!("  MAX_REQUEST: max buffered request size, e.g. 64M (default), 128M, 512K");
-        std::process::exit(2);
-    }
-    let listen = args[1].clone();
-    let upstream = Arc::new(args[2].clone());
-    let max_request = match args.get(3) {
-        None => DEFAULT_MAX_REQUEST,
-        Some(s) => match parse_size(s) {
-            Some(n) => n,
-            None => {
-                eprintln!("[phpsafepass] bad MAX_REQUEST: {s}");
-                std::process::exit(2);
-            }
-        },
+const USAGE: &str = "\
+usage: phpsafepass LISTEN UPSTREAM [options]
+       phpsafepass --health TARGET
+
+  LISTEN, UPSTREAM, TARGET   host:port or /path/to.sock
+
+options:
+  --max-request SIZE   max buffered request size (default 64M); set near your
+                       PHP post_max_size. Accepts K/M/G suffixes or plain bytes.
+  --max-fields N       max form fields, multipart or urlencoded (default 1000)
+  --max-depth N        max a[b][c]... name nesting per field (default 32)";
+
+enum Mode {
+    Run { listen: String, upstream: String, cfg: Config },
+    Health(String),
+}
+
+/// Parse argv (without the program name). Flags take a following value.
+fn parse_args(argv: &[String]) -> Result<Mode, String> {
+    let mut pos: Vec<String> = Vec::new();
+    let mut max_request = DEFAULT_MAX_REQUEST;
+    let mut limits = check::Limits::default();
+    let mut i = 0;
+    let next = |i: usize, what: &str| {
+        argv.get(i + 1).cloned().ok_or(format!("{what} needs a value"))
     };
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--health" => return Ok(Mode::Health(next(i, "--health")?)),
+            "--max-request" => {
+                let v = next(i, "--max-request")?;
+                max_request = parse_size(&v).ok_or(format!("bad --max-request: {v}"))?;
+                i += 2;
+            }
+            "--max-fields" => {
+                let v = next(i, "--max-fields")?;
+                limits.max_fields = v.parse().map_err(|_| format!("bad --max-fields: {v}"))?;
+                i += 2;
+            }
+            "--max-depth" => {
+                let v = next(i, "--max-depth")?;
+                limits.max_depth = v.parse().map_err(|_| format!("bad --max-depth: {v}"))?;
+                i += 2;
+            }
+            s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
+            _ => {
+                pos.push(argv[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if pos.len() != 2 {
+        return Err("need exactly LISTEN and UPSTREAM".into());
+    }
+    Ok(Mode::Run {
+        listen: pos[0].clone(),
+        upstream: pos[1].clone(),
+        cfg: Config { max_request, limits },
+    })
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (listen, upstream, cfg) = match parse_args(&argv) {
+        Ok(Mode::Health(target)) => health(&target),
+        Ok(Mode::Run { listen, upstream, cfg }) => (listen, upstream, cfg),
+        Err(e) => {
+            eprintln!("phpsafepass: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let upstream = Arc::new(upstream);
 
     let listener = match Listener::bind(&listen) {
         Ok(l) => l,
@@ -304,13 +360,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("[phpsafepass] {listen} -> {upstream} (max request {max_request} B)");
+    eprintln!(
+        "[phpsafepass] {listen} -> {upstream} (max request {} B, {} fields, depth {})",
+        cfg.max_request, cfg.limits.max_fields, cfg.limits.max_depth
+    );
 
     loop {
         match listener.accept() {
             Ok(client) => {
                 let up = Arc::clone(&upstream);
-                std::thread::spawn(move || serve(client, up, max_request));
+                std::thread::spawn(move || serve(client, up, cfg));
             }
             Err(_) => continue,
         }
@@ -319,7 +378,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::*;
 
     #[test]
     fn parse_size_units_and_bytes() {
@@ -332,5 +391,41 @@ mod tests {
         assert_eq!(parse_size(""), None);
         assert_eq!(parse_size("abc"), None);
         assert_eq!(parse_size("M"), None);
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_defaults_and_flags() {
+        match parse_args(&args(&["127.0.0.1:9000", "php:9000"])).unwrap() {
+            Mode::Run { listen, upstream, cfg } => {
+                assert_eq!(listen, "127.0.0.1:9000");
+                assert_eq!(upstream, "php:9000");
+                assert_eq!(cfg.max_request, DEFAULT_MAX_REQUEST);
+                assert_eq!(cfg.limits.max_fields, check::DEFAULT_MAX_FIELDS);
+                assert_eq!(cfg.limits.max_depth, check::DEFAULT_MAX_DEPTH);
+            }
+            _ => panic!("expected Run"),
+        }
+        match parse_args(&args(&["a:1", "b:2", "--max-request", "8M", "--max-fields", "200", "--max-depth", "8"])).unwrap() {
+            Mode::Run { cfg, .. } => {
+                assert_eq!(cfg.max_request, 8 << 20);
+                assert_eq!(cfg.limits.max_fields, 200);
+                assert_eq!(cfg.limits.max_depth, 8);
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn parse_args_health_and_errors() {
+        assert!(matches!(parse_args(&args(&["--health", "php:9000"])).unwrap(), Mode::Health(t) if t == "php:9000"));
+        assert!(parse_args(&args(&["only-one"])).is_err());
+        assert!(parse_args(&args(&["a:1", "b:2", "c:3"])).is_err());
+        assert!(parse_args(&args(&["a:1", "b:2", "--nope"])).is_err());
+        assert!(parse_args(&args(&["a:1", "b:2", "--max-fields", "xx"])).is_err());
+        assert!(parse_args(&args(&["a:1", "b:2", "--max-request"])).is_err());
     }
 }

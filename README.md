@@ -60,20 +60,37 @@ plus the upload-progress path — see the
 
 So re-serializing "clean" multipart bytes does **not** fix them: a perfectly
 well-formed body with thousands of deeply nested field names triggers the bug
-just the same. What phpsafepass does is **partial hardening**: the field-count
-and nesting caps blunt the allocation explosion, a tight `MAX_REQUEST` bounds
-the memory a request can drive PHP to allocate, and the upload-progress field
-is refused. That raises the bar; it does not remove the vulnerability.
+just the same.
 
-**This is not a fix. Patch PHP** (October 2026 security release), and apply
-the upstream mitigations (`session.upload_progress.enabled=0`,
-`memory_limit=-1`) where you can't patch yet. phpsafepass only buys time, and
-only partially — it does nothing for the `unserialize()`/`session_start()`
-variant or for PHP bugs outside request parsing (e.g. the SOAP UAF,
-CVE-2026-6722).
+**How phpsafepass actually helps.** Not by spotting malicious bytes — there
+are none to spot — but by keeping *every* request it forwards cheap enough
+that PHP won't hit the OOM-fatal while parsing it. With `--max-fields 1000`
+and `--max-depth 32`, the nested structures PHP builds from a request are
+bounded to tens of MB at most; `--max-request` bounds the raw bytes. Under a
+normal `memory_limit` (default 128M) that stays comfortably below the limit,
+so the fatal that the whole exploit chain depends on never fires on a request
+that passed through. For the front-door automatic-parsing trigger
+(multipart/urlencoded → `$_POST`/`$_FILES`), that cuts off the chain. The
+upload-progress field is refused on top.
 
-> **Tune it for this to matter:** set `MAX_REQUEST` at or near your PHP
-> `post_max_size` (default 8M). Left at 64M, the memory-pressure bound is weak.
+**Where this still falls short — know these:**
+
+- It assumes real headroom under `memory_limit`. On a host with a low limit
+  (some shared hosting uses 32–64M) or an app already near its limit, tighten
+  the caps (`--max-fields`, `--max-depth`, `--max-request`) accordingly.
+- It does nothing for the `unserialize()` / `session_start()` variant — that
+  decodes data the application handles, not the request body phpsafepass
+  parses — nor for PHP bugs outside request parsing (e.g. the SOAP UAF,
+  CVE-2026-6722).
+
+**It is still not a fix. Patch PHP** (October 2026 security release). If you
+genuinely can't, either put phpsafepass in front with tight caps **and keep a
+normal finite `memory_limit`** (it's your backstop; no allowed request should
+approach it), *or*, without a proxy, apply the upstream mitigations
+(`session.upload_progress.enabled=0`, and `memory_limit=-1` — which removes
+the trigger but drops your memory backstop, so it trades RCE risk for DoS
+risk). Don't do `memory_limit=-1` *and* run phpsafepass; that just throws away
+the backstop. phpsafepass only buys time.
 
 ## Written in Rust
 
@@ -140,18 +157,25 @@ services:
 ## Run
 
 ```
-phpsafepass LISTEN UPSTREAM [MAX_REQUEST]
+phpsafepass LISTEN UPSTREAM [--max-request SIZE] [--max-fields N] [--max-depth N]
 ```
 
 `LISTEN` and `UPSTREAM` are each `host:port` or `/path/to.sock`. phpsafepass
 listens where the web server connects, and forwards to the PHP-FPM pool.
-`MAX_REQUEST` caps the buffered request size (params + body) to protect the
-proxy's own memory — e.g. `64M` (default), `128M`, `512K`, or a plain byte
-count.
+
+| flag | default | what it bounds |
+|------|---------|----------------|
+| `--max-request` | `64M` | buffered request size (params + body). Set it **near your PHP `post_max_size`**. Accepts `K`/`M`/`G` or plain bytes. |
+| `--max-fields` | `1000` | form fields (multipart parts / urlencoded pairs); PHP's `max_input_vars` default |
+| `--max-depth` | `32` | `a[b][c]…` array nesting per field name |
+
+These three caps are the lever that keeps every allowed request cheap enough
+to stay well under PHP's `memory_limit` — see below. Tighten them on hosts
+with a low `memory_limit`.
 
 ```bash
-# TCP both sides
-phpsafepass 127.0.0.1:10001 127.0.0.1:9000
+# TCP both sides, tuned for an 8M post_max_size
+phpsafepass 127.0.0.1:10001 127.0.0.1:9000 --max-request 8M
 
 # listen on a Unix socket, forward to the pool's socket
 phpsafepass /run/phpsafepass.sock /run/php/php5.6-fpm.sock
@@ -183,7 +207,7 @@ exactly as before; phpsafepass passes those params through untouched.
 Fair — a lot of this was written with an AI, and this is a thing you'd put
 directly between the internet and your PHP. You shouldn't take it on faith.
 
-So it's kept small and boring on purpose: the whole program is about 750
+So it's kept small and boring on purpose: the whole program is about 800
 lines of dependency-free Rust across four files, with a roughly equal amount
 of tests. That's little enough that you can just read it — and you should,
 before you run it. Start with [`src/check.rs`](src/check.rs); that's the

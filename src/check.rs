@@ -27,17 +27,30 @@ pub enum Outcome {
     Reject { status: u16, msg: &'static str },
 }
 
-/// Max form fields (multipart parts / urlencoded pairs). PHP's own
-/// `max_input_vars` default is 1000; matching it keeps legit forms working
-/// while capping the allocation-multiplier the CVEs lean on.
-const MAX_FIELDS: usize = 1000;
-/// Max `a[b][c]...` array nesting per field name. Legit forms nest a few
-/// levels; this caps the per-field allocation explosion.
-const MAX_NAME_DEPTH: usize = 32;
+/// Tunable caps that bound how much a single request can make PHP allocate
+/// while parsing it — the lever that keeps every allowed request comfortably
+/// under `memory_limit`, so the OOM-fatal that drives the 2026 CVEs can't
+/// fire. Tighten them on hosts with a low `memory_limit`.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Max form fields (multipart parts / urlencoded pairs).
+    pub max_fields: usize,
+    /// Max `a[b][c]...` array nesting per field name.
+    pub max_depth: usize,
+}
+
+pub const DEFAULT_MAX_FIELDS: usize = 1000; // PHP's max_input_vars default
+pub const DEFAULT_MAX_DEPTH: usize = 32; // legit forms nest a few levels
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { max_fields: DEFAULT_MAX_FIELDS, max_depth: DEFAULT_MAX_DEPTH }
+    }
+}
 
 /// Check one request. `params` are the decoded FastCGI name/value pairs,
 /// `body` the concatenated STDIN.
-pub fn check(params: &[(&[u8], &[u8])], body: &[u8]) -> Outcome {
+pub fn check(params: &[(&[u8], &[u8])], body: &[u8], limits: Limits) -> Outcome {
     let content_type = params.iter().find(|(k, _)| *k == b"CONTENT_TYPE").map(|(_, v)| *v);
 
     if let Some(ct) = content_type {
@@ -45,13 +58,13 @@ pub fn check(params: &[(&[u8], &[u8])], body: &[u8]) -> Outcome {
             if let Some(base) = media_base(ct) {
                 let base = base.as_slice();
                 if base == b"multipart/form-data" {
-                    return match sanitize_multipart(ct, body) {
+                    return match sanitize_multipart(ct, body, limits) {
                         Ok((nct, nbody)) => Outcome::Rewrite { content_type: nct, body: nbody },
                         Err((status, msg)) => Outcome::Reject { status, msg },
                     };
                 } else if base == b"application/x-www-form-urlencoded" {
                     // forwarded verbatim; we only reject the explosion shapes
-                    if let Err((status, msg)) = check_urlencoded_shape(body) {
+                    if let Err((status, msg)) = check_urlencoded_shape(body, limits) {
                         return Outcome::Reject { status, msg };
                     }
                 }
@@ -83,7 +96,7 @@ fn name_depth(name: &[u8], encoded: bool) -> usize {
 
 /// Reject urlencoded bodies with too many fields or too deeply nested keys
 /// (the allocation-explosion shapes). The body itself is forwarded verbatim.
-fn check_urlencoded_shape(body: &[u8]) -> Result<(), (u16, &'static str)> {
+fn check_urlencoded_shape(body: &[u8], limits: Limits) -> Result<(), (u16, &'static str)> {
     let mut fields = 0usize;
     let mut p = 0;
     while p < body.len() {
@@ -91,7 +104,7 @@ fn check_urlencoded_shape(body: &[u8]) -> Result<(), (u16, &'static str)> {
         let pairlen = rel.unwrap_or(body.len() - p);
         if pairlen > 0 {
             fields += 1;
-            if fields > MAX_FIELDS {
+            if fields > limits.max_fields {
                 return Err((400, "Too many form fields"));
             }
             let pair = &body[p..p + pairlen];
@@ -99,7 +112,7 @@ fn check_urlencoded_shape(body: &[u8]) -> Result<(), (u16, &'static str)> {
                 Some(eq) => &pair[..eq],
                 None => pair,
             };
-            if name_depth(key, true) > MAX_NAME_DEPTH {
+            if name_depth(key, true) > limits.max_depth {
                 return Err((400, "Form field name nested too deep"));
             }
         }
@@ -133,7 +146,7 @@ struct Part<'a> {
     data: &'a [u8],
 }
 
-fn sanitize_multipart(ct: &[u8], body: &[u8]) -> Result<(String, Vec<u8>), (u16, &'static str)> {
+fn sanitize_multipart(ct: &[u8], body: &[u8], limits: Limits) -> Result<(String, Vec<u8>), (u16, &'static str)> {
     let boundary = mp_param(ct, "boundary").ok_or((400, "Missing multipart boundary"))?;
     if boundary.is_empty() {
         return Err((400, "Missing multipart boundary"));
@@ -185,10 +198,10 @@ fn sanitize_multipart(ct: &[u8], body: &[u8]) -> Result<(String, Vec<u8>), (u16,
             return Err((400, "Invalid character in multipart field name"));
         }
         // allocation-explosion guards (CVE-2026-109618/109619 triggers)
-        if name_depth(&name, false) > MAX_NAME_DEPTH {
+        if name_depth(&name, false) > limits.max_depth {
             return Err((400, "Multipart field name nested too deep"));
         }
-        if parts.len() >= MAX_FIELDS {
+        if parts.len() >= limits.max_fields {
             return Err((400, "Too many multipart fields"));
         }
         let filename = mp_param(disposition, "filename");
@@ -361,6 +374,11 @@ mod tests {
 
     // string literals are 'static, so the returned slices outlive the
     // (temporary) argument array
+    // run check() with default limits
+    fn c(params: &[(&[u8], &[u8])], body: &[u8]) -> Outcome {
+        check(params, body, Limits::default())
+    }
+
     fn pairs(kv: &[(&'static str, &'static str)]) -> Vec<(&'static [u8], &'static [u8])> {
         kv.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())).collect()
     }
@@ -377,7 +395,7 @@ mod tests {
     #[test]
     fn get_passes() {
         let p = pairs(&[("REQUEST_METHOD", "GET"), ("QUERY_STRING", "a=1")]);
-        assert!(matches!(check(&p, b""), Outcome::Pass));
+        assert!(matches!(c(&p, b""), Outcome::Pass));
     }
 
     #[test]
@@ -388,14 +406,14 @@ mod tests {
             ("text/plain", b"anything at all"),
         ] {
             let p = pairs(&[("CONTENT_TYPE", ct)]);
-            assert!(matches!(check(&p, body), Outcome::Pass), "ct={ct}");
+            assert!(matches!(c(&p, body), Outcome::Pass), "ct={ct}");
         }
     }
 
     #[test]
     fn multipart_is_reserialized() {
         let p = pairs(&[("CONTENT_TYPE", "multipart/form-data; boundary=XX")]);
-        match check(&p, GOOD_MP) {
+        match c(&p, GOOD_MP) {
             Outcome::Rewrite { content_type, body } => {
                 assert!(!content_type.contains("boundary=XX"), "{content_type}");
                 let nb = content_type.split("boundary=").nth(1).unwrap();
@@ -420,7 +438,7 @@ mod tests {
         body.extend_from_slice(payload);
         body.extend_from_slice(b"\r\n--XX--\r\n");
         let p = pairs(&[("CONTENT_TYPE", "multipart/form-data; boundary=XX")]);
-        match check(&p, &body) {
+        match c(&p, &body) {
             Outcome::Rewrite { body, .. } => {
                 assert!(find(&body, payload).is_some(), "binary payload not preserved");
             }
@@ -432,7 +450,7 @@ mod tests {
     fn reject_upload_progress() {
         let p = pairs(&[("CONTENT_TYPE", "multipart/form-data; boundary=XX")]);
         let body = b"--XX\r\nContent-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nx\r\n--XX--\r\n";
-        assert_eq!(reject_status(check(&p, body)), 400);
+        assert_eq!(reject_status(c(&p, body)), 400);
     }
 
     #[test]
@@ -445,11 +463,11 @@ mod tests {
             b"--XX\r\nContent-Disposition: form-data; name=\"a\\\"b\"\r\n\r\nhi\r\n--XX--\r\n", // quote/backslash
         ];
         for body in cases {
-            assert_eq!(reject_status(check(&xx, body)), 400, "{:?}", String::from_utf8_lossy(body));
+            assert_eq!(reject_status(c(&xx, body)), 400, "{:?}", String::from_utf8_lossy(body));
         }
         // no boundary param at all
         let nb = pairs(&[("CONTENT_TYPE", "multipart/form-data")]);
-        assert_eq!(reject_status(check(&nb, b"x")), 400);
+        assert_eq!(reject_status(c(&nb, b"x")), 400);
     }
 
     #[test]
@@ -469,24 +487,24 @@ mod tests {
     #[test]
     fn urlencoded_normal_passes() {
         let p = pairs(&[("CONTENT_TYPE", "application/x-www-form-urlencoded")]);
-        assert!(matches!(check(&p, b"a=1&b=2&items[0][sku]=x&items[0][qty]=3"), Outcome::Pass));
+        assert!(matches!(c(&p, b"a=1&b=2&items[0][sku]=x&items[0][qty]=3"), Outcome::Pass));
     }
 
     #[test]
     fn urlencoded_too_many_fields() {
         let many = vec!["a=1"; 1001].join("&");
         let p = pairs(&[("CONTENT_TYPE", "application/x-www-form-urlencoded")]);
-        assert_eq!(reject_status(check(&p, many.as_bytes())), 400);
+        assert_eq!(reject_status(c(&p, many.as_bytes())), 400);
     }
 
     #[test]
     fn urlencoded_deep_key_rejected_plain_and_encoded() {
         let p = pairs(&[("CONTENT_TYPE", "application/x-www-form-urlencoded")]);
         let plain = format!("a{}=1", "[x]".repeat(40));
-        assert_eq!(reject_status(check(&p, plain.as_bytes())), 400);
+        assert_eq!(reject_status(c(&p, plain.as_bytes())), 400);
         // same, but brackets percent-encoded — PHP decodes these first
         let encoded = format!("a{}=1", "%5Bx%5D".repeat(40));
-        assert_eq!(reject_status(check(&p, encoded.as_bytes())), 400);
+        assert_eq!(reject_status(c(&p, encoded.as_bytes())), 400);
     }
 
     #[test]
@@ -497,7 +515,7 @@ mod tests {
         }
         body.extend_from_slice(b"--XX--\r\n");
         let p = pairs(&[("CONTENT_TYPE", "multipart/form-data; boundary=XX")]);
-        assert_eq!(reject_status(check(&p, &body)), 400);
+        assert_eq!(reject_status(c(&p, &body)), 400);
     }
 
     #[test]
@@ -505,7 +523,7 @@ mod tests {
         let name = format!("a{}", "[x]".repeat(40));
         let body = format!("--XX\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\nx\r\n--XX--\r\n");
         let p = pairs(&[("CONTENT_TYPE", "multipart/form-data; boundary=XX")]);
-        assert_eq!(reject_status(check(&p, body.as_bytes())), 400);
+        assert_eq!(reject_status(c(&p, body.as_bytes())), 400);
     }
 
     #[test]
@@ -518,6 +536,6 @@ mod tests {
     fn empty_body_multipart_passes() {
         // CONTENT_TYPE multipart but no body: nothing to parse, forward as-is
         let p = pairs(&[("CONTENT_TYPE", "multipart/form-data; boundary=XX")]);
-        assert!(matches!(check(&p, b""), Outcome::Pass));
+        assert!(matches!(c(&p, b""), Outcome::Pass));
     }
 }

@@ -15,7 +15,7 @@ Today the web server speaks FastCGI straight to PHP-FPM:
 
 ```
    ┌──────────────────────┐    FastCGI    ┌───────────┐
-   │  nginx / Apache / …   │ ────────────► │  PHP-FPM  │
+   │  nginx / Apache / …  │ ────────────► │  PHP-FPM  │
    └──────────────────────┘               └───────────┘
 ```
 
@@ -24,7 +24,7 @@ change — and checks every request before PHP ever sees it:
 
 ```
    ┌──────────────────────┐   FastCGI   ┌───────────────┐   FastCGI   ┌───────────┐
-   │  nginx / Apache / …   │ ──────────► │  phpsafepass  │ ──────────► │  PHP-FPM  │
+   │  nginx / Apache / …  │ ──────────► │  phpsafepass  │ ──────────► │  PHP-FPM  │
    └──────────────────────┘             └───────┬───────┘             └───────────┘
                                                 │
                                                 ╳  malformed or dangerous request:
